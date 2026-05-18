@@ -31,6 +31,7 @@ MiniCode4j is built for local development workflows: reading files, searching co
 - append-only JSONL sessions with `list`, `rename`, `resume`, and `fork`
 - manual `/compact` and full autoCompact
 - Windows launcher and runnable fat jar
+- This branch is entirely implemented in Java, while the `default-ts-ui` branch features a more visually appealing TypeScript version of the TUI.
 
 ## Build
 

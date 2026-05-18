@@ -31,6 +31,7 @@ MiniCode4j 面向本地开发工作流：读文件、搜代码、执行命令、
 - append-only JSONL session，支持 `list`、`rename`、`resume`、`fork`
 - manual `/compact` 与 full autoCompact
 - Windows launcher 与可运行 fat jar
+- 本分支完全由Java编写，`default-ts-ui`分支有更加美观的TypeScript版本的TUI。
 
 ## 构建
 
