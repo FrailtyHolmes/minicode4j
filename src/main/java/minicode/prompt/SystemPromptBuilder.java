@@ -13,13 +13,51 @@ import java.util.List;
 import java.util.Objects;
 import java.util.StringJoiner;
 
+/**
+ * 把"身份、规则、工具、Skill、MCP、AGENTS.md"等动态信息拼装成发给 LLM 的 system prompt。
+ *
+ * <p>对 Coding Agent 而言 system prompt 是 LLM 的唯一编程接口：要做什么、不做什么、
+ * 用什么工具、走什么协议，全靠这段 ~3000 字文本。本类把 prompt 切成 10 段（身份、cwd、
+ * 通用规则、AGENTS.md 入口、工具清单、Skill 清单、MCP 清单、权限边界、progress/final 协议、
+ * 各工具使用细则），用 {@link StringJoiner} 以双换行分隔，便于 LLM 按 Markdown 段落理解。</p>
+ *
+ * <p>调用关系：每次 Turn 开始前由 ApplicationServices.withFreshSystemPrompt 重新调用
+ * {@link #build(Input)} 构建，结果作为 SystemMessage 放入对话首位发给 Anthropic API。
+ * 之所以"每次都重建而不缓存"，是因为 cwd、工具列表、Skill、MCP 状态、AGENTS.md 内容
+ * 都可能在 Turn 之间变化；构建本身 &lt;5ms，相比一次 HTTP 调用可忽略。</p>
+ *
+ * <p>关键设计取舍：</p>
+ * <ul>
+ *   <li>用 Java 21 Text Block 写多行规则段，比字符串拼接可读得多。</li>
+ *   <li>动态段（tools/skills/mcp）和静态段同等对待，全部走同一个 joiner，便于扩展。</li>
+ *   <li>AGENTS.md 通过 {@link #maybeRead} 在末尾追加，让用户无需改代码即可影响 LLM 行为。</li>
+ * </ul>
+ */
 public final class SystemPromptBuilder {
+    /**
+     * 构建一次 system prompt 所需的全部动态上下文。
+     *
+     * <p>紧凑构造器会把 home / cwd 规范化为绝对路径，并把 skills、mcpServers
+     * 拷贝成不可变列表，避免外部后续修改影响已构建的 Input 实例。</p>
+     *
+     * @param home 用户主目录（用于读取全局 AGENTS.md），构造时会被规范化为绝对路径
+     * @param cwd 当前工作目录（用于身份段以及读取项目级 AGENTS.md），构造时会被规范化为绝对路径
+     * @param tools 当前可用的工具注册表，用于生成"Available tools"段
+     * @param skills 已发现的 Skill 摘要列表，用于生成"Available skills"段
+     * @param mcpServers 已配置的 MCP 服务器摘要列表，列表非空时才会出现 MCP 段
+     */
     public record Input(Path home, Path cwd, ToolRegistry tools, List<SkillSummary> skills,
                         List<McpServerSummary> mcpServers) {
+        /**
+         * 便捷构造器：仅指定 home/cwd/tools，skills 和 mcpServers 默认为空列表。
+         */
         public Input(Path home, Path cwd, ToolRegistry tools) {
             this(home, cwd, tools, List.of());
         }
 
+        /**
+         * 便捷构造器：在 {@link #Input(Path, Path, ToolRegistry)} 基础上额外指定 skills，mcpServers 默认为空。
+         */
         public Input(Path home, Path cwd, ToolRegistry tools, List<SkillSummary> skills) {
             this(home, cwd, tools, skills, List.of());
         }
@@ -33,6 +71,19 @@ public final class SystemPromptBuilder {
         }
     }
 
+    /**
+     * 根据给定上下文构建一段完整的 system prompt 文本。
+     *
+     * <p>输出按"身份 + cwd + 通用规则 + AGENTS.md 入口 + 工具清单 + Skill 清单 +
+     * （可选）MCP 清单 + 权限边界 + progress/final 协议 + 工具使用细则 +
+     * 全局 AGENTS.md + 项目 AGENTS.md"的顺序拼接，段落之间用空行分隔。</p>
+     *
+     * <p>本方法不缓存：每次调用都会重新读取 AGENTS.md 文件并重新生成所有段落，
+     * 以保证 cwd 变化、工具/Skill 增减、AGENTS.md 编辑都能即时反映到下一次 LLM 请求。</p>
+     *
+     * @param input 构建所需的动态上下文，不能为 null
+     * @return 拼装好的 system prompt 文本
+     */
     public String build(Input input) {
         Objects.requireNonNull(input, "input");
         StringJoiner prompt = new StringJoiner("\n\n");
@@ -183,6 +234,17 @@ public final class SystemPromptBuilder {
         return value.substring(0, maxChars - 3) + "...";
     }
 
+    /**
+     * 如果指定路径存在 AGENTS.md（或类似指令文件），将其内容追加到 prompt 末尾。
+     *
+     * <p>用于把"全局指令"和"项目指令"以纯文本方式注入 system prompt：
+     * 文件不存在则静默跳过；读取失败时也不会抛异常，而是把错误信息作为占位段加入，
+     * 避免 IO 错误打断整次 prompt 构建。</p>
+     *
+     * @param path 待读取的 AGENTS.md 路径
+     * @param label 段落标签，例如 "Global instructions" 或 "Project instructions"
+     * @param prompt 累积 prompt 段落的 joiner，本方法只追加不修改既有段
+     */
     private void maybeRead(Path path, String label, StringJoiner prompt) {
         if (!Files.exists(path)) {
             return;

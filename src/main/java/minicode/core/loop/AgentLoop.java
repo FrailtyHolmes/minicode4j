@@ -34,6 +34,26 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
+/**
+ * Agent 主循环：在一个 turn 内反复执行 model → tool → model，直到模型给出 final 答复、
+ * 等用户输入、超步数、被取消或连续空响应兜底。整门课最核心的类。
+ *
+ * <p>这个类的核心职责是把"调模型 - 跑工具 - 处理结果 - 再调模型"这条朴素链路
+ * 包装成一个稳健的有界状态机：
+ * <ul>
+ *   <li>用三个独立计数器（stepIndex / emptyResponseCount / recoverableThinkingRetryCount）
+ *       防止三种性质不同的死循环。</li>
+ *   <li>用 {@link CancellationToken} 在每个关键阶段做协作式取消 check。</li>
+ *   <li>把模型错误、工具错误、空响应、取消等所有终止原因都显式建模成
+ *       {@link AgentTurnResult} 的不同分支，对外永远返回结果对象而不抛异常。</li>
+ *   <li>把工具结果、上下文压缩、token 统计等副作用都写入 {@link PersistenceAction} 列表，
+ *       由调用方决定何时落盘，loop 自己不直接碰持久化。</li>
+ * </ul>
+ *
+ * <p>线程模型：本类不自带异步，{@code runTurn} 是同步阻塞调用。取消通过
+ * {@link CancellationToken} 实现（不依赖 {@link Thread#interrupt()}），
+ * UI 渲染在另一线程，因此即便循环阻塞也不会卡住界面。
+ */
 public final class AgentLoop {
     private static final String EMPTY_RESPONSE_MESSAGE =
             "The model returned an empty response after retries. Please try again.";
@@ -49,6 +69,7 @@ public final class AgentLoop {
             "Your previous response hit max_tokens during thinking before producing the next actionable step. Resume immediately and continue with the next concrete tool call, code change, or an explicit <final> answer only if the task is complete. Do not repeat the earlier plan.";
     private static final String PAUSE_TURN_THINKING_CONTINUATION_PROMPT =
             "Resume from the previous pause_turn and continue the task immediately. Produce the next concrete tool call, code change, or an explicit <final> answer only if the task is complete.";
+    /** 单次模型调用的最大重试次数，含首次。3 次覆盖大多数瞬时错误（429、502 等）。 */
     private static final int MODEL_REQUEST_ATTEMPTS = 3;
 
     private final ModelAdapter modelAdapter;
@@ -57,8 +78,12 @@ public final class AgentLoop {
     private final ContextManager contextManager;
     private final ContextStatsCalculator contextStatsCalculator;
     private final AutoCompactController autoCompactController;
+    /** 同一 turn 内允许连续空响应被催促重试的最大次数；超过则进入 emptyFallback 兜底。 */
     private final int maxEmptyResponseRetries;
 
+    /**
+     * 最简构造：不接工具执行器、空响应重试上限默认 2。一般用于纯对话场景或单元测试。
+     */
     public AgentLoop(ModelAdapter modelAdapter, AgentEventSink eventSink) {
         this(modelAdapter, eventSink, ToolExecutor.unsupported(), 2);
     }
@@ -106,6 +131,19 @@ public final class AgentLoop {
                 autoCompactController, 2);
     }
 
+    /**
+     * 全参主构造：装配所有依赖并校验非空、参数合法。其它重载都最终委托到这里。
+     *
+     * @param modelAdapter            模型适配层（如 {@code AnthropicModelAdapter}），把消息转成模型协议并解析返回
+     * @param eventSink               事件汇，循环里的关键状态转换都会通过它推给 UI/日志/持久化
+     * @param toolExecutor            工具执行器；不需要工具时传 {@link ToolExecutor#unsupported()}
+     * @param contextManager          上下文管理器，负责微压缩、超大工具结果替换、token 预算控制
+     * @param contextStatsCalculator  token 统计器，每步循环前算一次，作为 autoCompact 决策依据
+     * @param autoCompactController   自动压缩控制器，token 接近上下文窗口上限时触发摘要压缩
+     * @param maxEmptyResponseRetries 空响应连续催促重试上限；非负整数
+     * @throws NullPointerException     任一依赖为 null 时抛出
+     * @throws IllegalArgumentException maxEmptyResponseRetries 为负时抛出
+     */
     public AgentLoop(ModelAdapter modelAdapter, AgentEventSink eventSink, ToolExecutor toolExecutor,
                      ContextManager contextManager, ContextStatsCalculator contextStatsCalculator,
                      AutoCompactController autoCompactController,
@@ -122,6 +160,25 @@ public final class AgentLoop {
         this.maxEmptyResponseRetries = maxEmptyResponseRetries;
     }
 
+    /**
+     * 执行一次完整的 agent turn：反复 model → tool → model 直到能给出终态。
+     *
+     * <p>主循环骨架（详见 docs/tutorial/ch02-agent-loop.md）：
+     * <ol>
+     *   <li>每步先做上下文预处理（微压缩 + 自动压缩 + 推 ContextStatsEvent）。</li>
+     *   <li>调模型（带 3 次重试）；模型抛错最终失败 → 返回 modelError。</li>
+     *   <li>分发到 {@link ToolCallsStep}（执行工具，工具异常吃掉转 ToolResult.error）
+     *       或 {@link AssistantStep}（处理空响应/可恢复 thinking 中断/PROGRESS/FINAL）。</li>
+     *   <li>每个关键阶段都 check {@link CancellationToken}，被取消则跳到 catch 走 cancelled 分支。</li>
+     * </ol>
+     *
+     * <p>对外保证：本方法不抛业务异常。所有终止原因都映射成
+     * {@link AgentTurnResult} 的 6 种 stopReason 之一返回，调用方用 switch 处理即可。
+     *
+     * @param request 本次 turn 的输入
+     * @return turn 终态：包含最终消息列表、持久化动作、停止原因与详情
+     * @throws NullPointerException request 为 null 时抛出
+     */
     public AgentTurnResult runTurn(AgentTurnRequest request) {
         Objects.requireNonNull(request, "request");
         List<ChatMessage> messages = new ArrayList<>(request.messages());
@@ -313,6 +370,21 @@ public final class AgentLoop {
         }
     }
 
+    /**
+     * 调一次模型，最多重试 {@link #MODEL_REQUEST_ATTEMPTS} 次。
+     *
+     * <p>关键设计：
+     * <ul>
+     *   <li>{@link CancellationRequestedException} 立即往外抛，不参与重试——取消优先级最高。</li>
+     *   <li>{@link ModelRequestException} 与其他 {@link RuntimeException} 分别保留，
+     *       交给上层区分"模型业务错"和"程序/网络异常"，错误信息更精确。</li>
+     *   <li>每次重试前再 check 一次取消，避免在等下一轮 sleep 期间用户已经按了 Ctrl+C。</li>
+     * </ul>
+     *
+     * @return 模型给出的下一步；正常返回时不会为 null（由 {@link ModelAdapter} 实现保证）
+     * @throws CancellationRequestedException 取消信号触发时
+     * @throws RuntimeException               最后一次重试仍失败时，抛出最后一次记录的异常
+     */
     private AgentStep nextWithRetries(List<ChatMessage> messages, CancellationToken cancellationToken) {
         RuntimeException lastException = null;
         for (int attempt = 1; attempt <= MODEL_REQUEST_ATTEMPTS; attempt++) {
@@ -334,6 +406,13 @@ public final class AgentLoop {
         return new ContextStatsCalculator(new TokenAccountingService(), new ModelContextWindow(128_000, 8_000));
     }
 
+    /**
+     * 自动压缩前置检查：如果 token 接近上下文窗口上限，就在调模型前先把历史摘要压缩一轮。
+     *
+     * <p>三种状态各推一种事件：STARTED（开始尝试）、COMPLETED（压缩成功，并写入持久化动作）、
+     * FAILED（压缩失败，循环继续走旧消息）、SKIPPED（未达阈值，仅在"非常规跳过"时才推事件，
+     * 避免事件流被低阈值跳过淹没）。
+     */
     private AutoCompactResult runAutoCompactPreflight(String turnId, List<ChatMessage> messages,
                                                       List<PersistenceAction> actions, ContextStats stats) {
         if (autoCompactController.willAttempt(List.copyOf(messages), stats)) {
@@ -394,6 +473,10 @@ public final class AgentLoop {
         return List.copyOf(retained);
     }
 
+    /**
+     * 追加一条消息：同时更新内存里的 messages、记录持久化动作、并推送 AssistantMessageEvent。
+     * 这三件事必须打包在一起做，否则 UI、内存、磁盘三者会出现不一致。
+     */
     private void appendMessage(String turnId, List<ChatMessage> messages, List<PersistenceAction> actions,
                                ChatMessage message) {
         messages.add(message);
@@ -439,6 +522,14 @@ public final class AgentLoop {
         return message;
     }
 
+    /**
+     * 把本轮新增的 ToolResultMessage 交给 contextManager 做 token 预算控制：
+     * 太大的工具结果会被替换成精简版（如"output truncated, 12345 bytes omitted"），
+     * 防止下一次模型请求的 prompt 直接超限。
+     *
+     * <p>同步更新 in-memory messages、actions（持久化记录）和入参列表本身，
+     * 并在确实有替换发生时推 ToolResultsBudgetedEvent。
+     */
     private void applyToolResultBudget(String turnId, List<ChatMessage> messages, List<PersistenceAction> actions,
                                        List<ToolResultMessage> toolResultMessages) {
         ToolResultBudgetResult budgetResult = contextManager.applyToolResultBudget(List.copyOf(toolResultMessages));
@@ -535,6 +626,11 @@ public final class AgentLoop {
         };
     }
 
+    /**
+     * 判断本步是否属于"可恢复的思考阶段截断"：
+     * 模型在 thinking 阶段被 max_tokens 或 pause_turn 打断，content 是空但其实只是"还没想完"，
+     * 这种情况下应该催它继续而不是当成空响应放弃。
+     */
     private boolean isRecoverableThinkingStop(AssistantStep step) {
         if (!step.content().isBlank() || step.diagnostics().isEmpty()) {
             return false;
@@ -549,6 +645,10 @@ public final class AgentLoop {
                 || diagnostics.ignoredBlockTypes().contains("thinking");
     }
 
+    /**
+     * 根据上下文挑选合适的"催继续"prompt：调过工具有错 / 调过工具没错 / 没调过工具，
+     * 三种话术对模型的引导效果差异很大，是 Agent 行为修正里很容易被忽略的细节。
+     */
     private String emptyResponseContinuationPrompt(boolean sawToolResultThisTurn, int toolErrorCount) {
         if (toolErrorCount > 0) {
             return EMPTY_RESPONSE_AFTER_TOOL_ERROR_CONTINUATION_PROMPT;
@@ -622,6 +722,12 @@ public final class AgentLoop {
                 request.cancellationToken());
     }
 
+    /**
+     * 推事件到 {@link AgentEventSink}，并吃掉所有 RuntimeException。
+     *
+     * <p>关键设计：UI/日志/订阅层失败属于"观察侧"问题，绝不能反过来打断核心 turn 流程
+     * （比如 UI 渲染崩了，agent 也得继续把任务做完）。所以这里有意吞掉异常。
+     */
     private void publishEvent(AgentEvent event) {
         try {
             eventSink.onEvent(event);

@@ -26,6 +26,27 @@ import java.nio.file.NoSuchFileException;
 import java.util.Objects;
 import java.util.Set;
 
+/**
+ * 读 UTF-8 文本文件的内置工具——是「Tool 接口怎么实现」的标准样板。
+ *
+ * <p>支持两种读法（互斥，不能混用）：
+ * <p>- <b>字符模式</b>：传 {@code offset} / {@code limit}，按字符位置切片；
+ * <p>- <b>行模式</b>：传 {@code lineStart} / {@code lineCount}，按 1-based 行号读。
+ *
+ * <p>典型职责拆分（实现 {@link Tool} 接口的四个方法）：
+ * <p>1. {@link #metadata()} 返回 {@code static final} 单例，类加载期就构造好；
+ * <p>2. {@link #inputSchema()} 同样是单例，描述入参 JSON 结构发给 LLM；
+ * <p>3. {@link #validateInput} 用链式 DSL 声明字段约束，附带跨字段互斥校验；
+ * <p>4. {@link #run} 内部分四步走：路径合法化（{@link WorkspacePathResolver}）→ 权限审批
+ *    （{@link ReadFilePathAccess}）→ 实际 IO → 切片并拼 header 返回。
+ *
+ * <p>设计亮点——返回内容里嵌入「下一步操作提示」：当文件被截断时，
+ * header 会写明 {@code TRUNCATED: yes - call read_file again with offset N}，
+ * 这样 LLM 一眼就知道下次怎么续读，比改 system prompt 教它续读更直接。
+ *
+ * <p>所有异常都在 {@link #run} 内部 catch 后转 {@link ToolResult#error(String)}，
+ * 严格遵循 {@link Tool#run} 的「不抛异常给 ToolRegistry」契约。
+ */
 public final class ReadFileTool implements Tool {
     private static final JsonNodeFactory JSON = JsonNodeFactory.instance;
     private static final int DEFAULT_READ_LIMIT = 12_000;
@@ -45,14 +66,30 @@ public final class ReadFileTool implements Tool {
     private final ReadFilePathAccess pathAccess;
     private final WorkspacePathResolver workspacePathResolver;
 
+    /**
+     * 默认构造器：用「不可用」的 {@link ReadFilePathAccess} 占位 + 默认的路径解析器。
+     *
+     * <p>主要给非交互场景或者测试用——一旦遇到需要权限审批的越界路径就会拒绝。
+     */
     public ReadFileTool() {
         this(ReadFilePathAccess.unavailable(), new WorkspacePathResolver());
     }
 
+    /**
+     * 注入自定义 {@link ReadFilePathAccess} 的构造器，路径解析器使用默认实现。
+     *
+     * @param pathAccess 路径权限审批器，越界路径走它的逻辑（弹窗 / 拒绝）
+     */
     public ReadFileTool(ReadFilePathAccess pathAccess) {
         this(pathAccess, new WorkspacePathResolver());
     }
 
+    /**
+     * 完全自定义版本——同时注入权限审批器与路径解析器，方便测试时用 fake 替身。
+     *
+     * @param pathAccess            路径权限审批器
+     * @param workspacePathResolver 把相对路径解析成绝对路径并做越界校验的解析器
+     */
     public ReadFileTool(ReadFilePathAccess pathAccess, WorkspacePathResolver workspacePathResolver) {
         this.pathAccess = Objects.requireNonNull(pathAccess, "pathAccess");
         this.workspacePathResolver = Objects.requireNonNull(workspacePathResolver, "workspacePathResolver");
@@ -68,6 +105,18 @@ public final class ReadFileTool implements Tool {
         return INPUT_SCHEMA;
     }
 
+    /**
+     * 用 {@code ToolInputValidation} 链式 DSL 声明入参约束。
+     *
+     * <p>字段层约束：
+     * <p>- {@code path}：必需，必须是合法路径字符串；
+     * <p>- {@code offset}/{@code limit}：可选整数，分别在 [0, MAX_INT] 与 [1, MAX_READ_LIMIT] 范围内；
+     * <p>- {@code lineStart}/{@code lineCount}：可选整数，{@code lineCount} 上限是 {@code MAX_LINE_COUNT}。
+     *
+     * <p>跨字段约束（用 {@code custom(...)} 自定义校验回调）：
+     * <p>1. 字符模式（offset/limit）和行模式（lineStart/lineCount）<b>不能混用</b>；
+     * <p>2. 传 {@code lineCount} 时必须同时传 {@code lineStart}（否则不知道从哪开始数）。
+     */
     @Override
     public ValidationResult validateInput(JsonNode input) {
         return ToolInputValidation.object(input)
@@ -93,6 +142,23 @@ public final class ReadFileTool implements Tool {
                 .build();
     }
 
+    /**
+     * 实际读取文件内容并按所选模式切片返回。
+     *
+     * <p>四步流程：
+     * <p>1. 用 {@link WorkspacePathResolver} 把相对路径解析成绝对路径，并校验是否越出 cwd；
+     * <p>2. 调 {@link ReadFilePathAccess#ensureReadAllowed} 走权限审批（越界路径会触发审批弹窗）；
+     * <p>3. 用 {@link Files#readString} 一次性读完整文件（UTF-8）；
+     * <p>4. 按行模式或字符模式切片，拼上带 TRUNCATED 提示的 header 一并返回。
+     *
+     * <p>所有可预期异常都在此处 catch 转 {@link ToolResult#error(String)}：
+     * 文件不存在 → "File not found: ..."；越界 → 解析器自带消息；
+     * IO 异常 → "Failed to read file ..."；其它 RuntimeException 兜底成「access denied」。
+     *
+     * @param normalizedInput 已通过 {@link #validateInput} 校验和规范化的入参
+     * @param toolContext     调用上下文，{@link ToolContext#cwd()} 用于解析相对路径
+     * @return 成功时 ok 包裹「header + 内容」，失败时 error 包裹友好错误信息
+     */
     @Override
     public ToolResult run(JsonNode normalizedInput, ToolContext toolContext) {
         String inputPath = normalizedInput.get("path").asText();
